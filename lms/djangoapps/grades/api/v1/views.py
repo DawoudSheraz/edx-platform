@@ -1,4 +1,5 @@
 """ API v0 views. """
+import json
 import logging
 from collections import defaultdict
 from contextlib import contextmanager
@@ -20,9 +21,13 @@ from edx_rest_framework_extensions.auth.session.authentication import SessionAut
 from enrollment import data as enrollment_data
 from lms.djangoapps.grades.api.serializers import StudentGradebookEntrySerializer
 from lms.djangoapps.grades.config.waffle import waffle_flags, WRITABLE_GRADEBOOK
+from lms.djangoapps.grades.constants import ScoreDatabaseTableEnum
 from lms.djangoapps.grades.course_grade_factory import CourseGradeFactory
+from lms.djangoapps.grades.models import PersistentSubsectionGrade, PersistentSubsectionGradeOverride
+from lms.djangoapps.grades.signals import signals
+from lms.djangoapps.grades.subsection_grade_factory import SubsectionGradeFactory
 from opaque_keys import InvalidKeyError
-from opaque_keys.edx.keys import CourseKey
+from opaque_keys.edx.keys import CourseKey, UsageKey
 from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
 from openedx.core.lib.api.authentication import OAuth2AuthenticationAllowInactiveUser
 from openedx.core.lib.api.view_utils import DeveloperErrorViewMixin
@@ -570,3 +575,78 @@ class GradebookView(GradeViewMixin, GenericAPIView):
                     entries.append(self._gradebook_entry(user, course, course_grade))
             serializer = StudentGradebookEntrySerializer(entries, many=True)
             return self.get_paginated_response(serializer.data)
+
+
+class GradebookBulkUpdateView(GradeViewMixin, GenericAPIView):
+    authentication_classes = (
+        JwtAuthentication,
+        OAuth2AuthenticationAllowInactiveUser,
+        SessionAuthenticationAllowInactiveUser,
+    )
+
+    permission_classes = (permissions.JWT_RESTRICTED_APPLICATION_OR_USER_ACCESS,)
+
+    required_scopes = ['grades:write']
+
+    @verify_course_exists
+    @verify_writable_gradebook_enabled
+    def post(self, request, course_id):
+        """
+        Creates `PersistentSubsectionGradeOverrides` for user_id/course_key/usage_key
+        specified in the request data.
+        """
+        course_key = get_course_key(request, course_id)
+        course = get_course_with_access(request.user, 'staff', course_key, depth=None)
+
+        result = defaultdict(lambda: defaultdict(dict))
+
+        for user_data in request.data:
+            subsection_grade = None
+            requested_user_id = user_data['user_id']
+            requested_usage_id = user_data['usage_id']
+            try:
+                user = USER_MODEL.objects.get(id=requested_user_id)
+                usage_key = UsageKey.from_string(requested_usage_id)
+                grade_override_data = user_data['grade']
+                subsection_grade = PersistentSubsectionGrade.objects.get(
+                    user_id=user.id,
+                    course_id=course_key,
+                    usage_key=usage_key
+                )
+            except (USER_MODEL.DoesNotExist, InvalidKeyError) as exc:
+                result[requested_user_id][requested_usage_id] = {
+                    'success': False,
+                    'reason': text_type(exc),
+                }
+            except PersistentSubsectionGrade.DoesNotExist:
+                factory = SubsectionGradeFactory(user, course)
+                subsection = course.get_child(usage_key)
+                if subsection:
+                    subsection_grade = factory.create(subsection)
+                else:
+                    result[requested_user_id][requested_usage_id] = {
+                        'success': False,
+                        'reason': 'usage_key {} does not exist in this course'.format(usage_key),
+                    }
+
+            if subsection_grade:
+                self._create_override(subsection_grade, **grade_override_data)
+                result[user.id][text_type(usage_key)] = {'success': True}
+
+        return Response(json.dumps(result), status=201, content_type='application/json')
+
+    def _create_override(self, subsection_grade, **override_data):
+        override, _ = PersistentSubsectionGradeOverride.objects.update_or_create(
+            grade=subsection_grade,
+            **override_data
+        )
+        signals.SUBSECTION_OVERRIDE_CHANGED.send(
+            sender=None,
+            user_id=subsection_grade.user_id,
+            course_id=text_type(subsection_grade.course_id),
+            usage_id=text_type(subsection_grade.usage_key),
+            only_if_higher=False,
+            modified=override.modified,
+            score_deleted=False,
+            score_db_table=ScoreDatabaseTableEnum.overrides
+        )
