@@ -1,7 +1,7 @@
 """ API v0 views. """
 import json
 import logging
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from contextlib import contextmanager
 from functools import wraps
 
@@ -577,7 +577,83 @@ class GradebookView(GradeViewMixin, GenericAPIView):
             return self.get_paginated_response(serializer.data)
 
 
+GradebookUpdateResponseItem = namedtuple('GradebookUpdateResponseItem', ['user_id', 'usage_id', 'success', 'reason'])
+
+
 class GradebookBulkUpdateView(GradeViewMixin, GenericAPIView):
+    """
+    **Use Case**
+        Creates `PersistentSubsectionGradeOverride` objects for multiple (user_id, usage_id)
+        pairs in a given course, and invokes a Django signal to update subsection grades in
+        an asynchronous celery task.
+
+    **Example Request**
+        POST /api/grades/v1/gradebook/{course_id}/bulk-update
+
+    **POST Parameters**
+        This endpoint does not accept any URL parameters.
+
+    **Example POST Data**
+        [
+          {
+            "user_id": 9,
+            "usage_id": "block-v1:edX+DemoX+Demo_Course+type@sequential+block@basic_questions",
+            "grade": {
+              "earned_all_override": 11,
+              "possible_all_override": 11,
+              "earned_graded_override": 11,
+              "possible_graded_override": 11
+            }
+          },
+          {
+            "user_id": 9,
+            "usage_id": "block-v1:edX+DemoX+Demo_Course+type@sequential+block@advanced_questions",
+            "grade": {
+              "earned_all_override": 10,
+              "possible_all_override": 15,
+              "earned_graded_override": 9,
+              "possible_graded_override": 12
+            }
+          }
+        ]
+
+    **POST Response Values**
+        An HTTP 201 may be returned if we attempted to modify any subsection grades.
+        An HTTP 404 may be returned for the following reasons:
+            * The requested course_key is invalid.
+            * No course corresponding to the requested key exists.
+            * The requesting user is not enrolled in the requested course.
+        An HTTP 403 may be returned if the `writable_gradebook` feature is not
+        enabled for this course.
+
+    **Example successful POST Response**
+        [
+          {
+            "user_id": 9,
+            "usage_id": "some-requested-usage-id",
+            "success": true,
+            "reason": null
+          },
+          {
+            "user_id": 9,
+            "usage_id": "an-invalid-usage-id",
+            "success": false,
+            "reason": "<class 'opaque_keys.edx.locator.BlockUsageLocator'>: not-a-valid-usage-key"
+          },
+          {
+            "user_id": 9,
+            "usage_id": "a-valid-usage-key-that-doesn't-exist",
+            "success": false,
+            "reason": "a-valid-usage-key-that-doesn't-exist does not exist in this course"
+          },
+          {
+            "user_id": 1234-I-DO-NOT-EXIST,
+            "usage_id": "a-valid-usage-key",
+            "success": false,
+            "reason": "User matching query does not exist."
+          }
+        ]
+    """
     authentication_classes = (
         JwtAuthentication,
         OAuth2AuthenticationAllowInactiveUser,
@@ -592,13 +668,15 @@ class GradebookBulkUpdateView(GradeViewMixin, GenericAPIView):
     @verify_writable_gradebook_enabled
     def post(self, request, course_id):
         """
-        Creates `PersistentSubsectionGradeOverrides` for user_id/course_key/usage_key
-        specified in the request data.
+        Creates or updates `PersistentSubsectionGradeOverrides` for the (user_id, usage_key)
+        specified in the request data.  The `SUBSECTION_OVERRIDE_CHANGED` signal is invoked
+        after the grade override is created, which triggers a celery task to update the
+        course and subsection grades for the specified user.
         """
         course_key = get_course_key(request, course_id)
         course = get_course_with_access(request.user, 'staff', course_key, depth=None)
 
-        result = defaultdict(lambda: defaultdict(dict))
+        result = []
 
         for user_data in request.data:
             subsection_grade = None
@@ -614,28 +692,45 @@ class GradebookBulkUpdateView(GradeViewMixin, GenericAPIView):
                     usage_key=usage_key
                 )
             except (USER_MODEL.DoesNotExist, InvalidKeyError) as exc:
-                result[requested_user_id][requested_usage_id] = {
-                    'success': False,
-                    'reason': text_type(exc),
-                }
+                result.append(GradebookUpdateResponseItem(
+                    user_id=requested_user_id,
+                    usage_id=requested_usage_id,
+                    success=False,
+                    reason=text_type(exc)
+                ))
             except PersistentSubsectionGrade.DoesNotExist:
                 factory = SubsectionGradeFactory(user, course)
                 subsection = course.get_child(usage_key)
                 if subsection:
                     subsection_grade = factory.create(subsection)
                 else:
-                    result[requested_user_id][requested_usage_id] = {
-                        'success': False,
-                        'reason': 'usage_key {} does not exist in this course'.format(usage_key),
-                    }
+                    result.append(GradebookUpdateResponseItem(
+                        user_id=requested_user_id,
+                        usage_id=requested_usage_id,
+                        success=False,
+                        reason='usage_key {} does not exist in this course'.format(usage_key)
+                    ))
 
             if subsection_grade:
                 self._create_override(subsection_grade, **grade_override_data)
-                result[user.id][text_type(usage_key)] = {'success': True}
+                result.append(GradebookUpdateResponseItem(
+                    user_id=user.id,
+                    usage_id=text_type(usage_key),
+                    success=True,
+                    reason=None
+                ))
 
-        return Response(json.dumps(result), status=201, content_type='application/json')
+        return Response(
+            json.dumps([item._asdict() for item in result]),
+            status=201,
+            content_type='application/json'
+        )
 
     def _create_override(self, subsection_grade, **override_data):
+        """
+        Helper method to create a `PersistentSubsectionGradeOverride` object
+        and send a `SUBSECTION_OVERRIDE_CHANGED` signal.
+        """
         override, _ = PersistentSubsectionGradeOverride.objects.update_or_create(
             grade=subsection_grade,
             **override_data
