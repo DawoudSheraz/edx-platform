@@ -1826,7 +1826,13 @@ class SelfPacedOutlineTest(CourseOutlineTest):
         )
         self.course_fixture.add_course_details({
             'self_paced': True,
-            'start_date': datetime.now() + timedelta(days=1)
+            'start_date': datetime.now() + timedelta(days=1),
+
+        })
+        self.course_fixture.add_advanced_settings({
+            'enable_timed_exams': {
+                'value': True
+            }
         })
         ConfigModelFixture('/config/self_paced', {'enabled': True}).install()
 
@@ -1865,6 +1871,64 @@ class SelfPacedOutlineTest(CourseOutlineTest):
         modal = subsection.edit()
         self.assertFalse(modal.has_release_date())
         self.assertFalse(modal.has_due_date())
+
+
+class InstructorPacedToSelfPacedOutlineTest(CourseOutlineTest):
+    """
+    Test the course outline when pacing is changed from
+    instructor to self paced.
+    """
+
+    def populate_course_fixture(self, course_fixture):
+        course_fixture.add_children(
+            XBlockFixtureDesc('chapter', SECTION_NAME).add_children(
+                XBlockFixtureDesc('sequential', SUBSECTION_NAME).add_children(
+                    XBlockFixtureDesc('vertical', UNIT_NAME)
+                )
+            ),
+        )
+        self.course_fixture.add_course_details({
+            'start_date': datetime.now() + timedelta(days=1),
+
+        })
+        self.course_fixture.add_advanced_settings({
+            'enable_timed_exams': {
+                'value': True
+            }
+        })
+
+    def test_due_dates_not_shown(self):
+        """
+        Related to EDUCATOR 1714: (https://openedx.atlassian.net/browse/EDUCATOR-1714)
+        Scenario: Ensure that due dates for timed exams
+            are not displayed on the course outline page when switched to
+            self-paced mode from instructor-paced.
+
+
+        Given an instructor paced course, add a due date for a subsection.
+        Change the course's pacing to self-paced.
+        Add the timed exam on the subsection on whom the due date was added.
+        Make sure adding the timed exam doesn't display the due date.
+        """
+        self.course_outline_page.visit()
+        section = self.course_outline_page.section(SECTION_NAME)
+        subsection = section.subsection(SUBSECTION_NAME)
+        modal = subsection.edit()
+        modal.due_date = '5/14/2016'
+
+        modal.save()
+        # Checking if the added due date saved
+        self.assertIn('May 14', subsection.due_date)
+        # Updating the course mode to self-paced
+        self.course_fixture.add_course_details({
+            'self_paced': True
+        })
+        # configure call to actually update course with new settings
+        self.course_fixture.configure_course()
+        self.course_outline_page.make_exam_timed()
+        # Reloading page after the changes
+        self.course_outline_page.visit()
+        self.assertIsNone(subsection.due_date)
 
 
 class CourseStatusOutlineTest(CourseOutlineTest):
